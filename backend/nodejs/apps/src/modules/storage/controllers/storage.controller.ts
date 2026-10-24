@@ -74,6 +74,7 @@ import { DocumentModel } from '../schema/document.schema';
 import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
 import { getMimeType } from '../mimetypes/mimetypes';
 import path from 'path';
+import type { FileHandle } from 'fs/promises';
 import { ErrorMetadata } from '../../../libs/errors/base.error';
 import { StorageError } from '../../../libs/errors/storage.errors';
 
@@ -801,6 +802,7 @@ export class StorageController {
         );
       }
       const adapter = await this.localArtifactAdapter(req);
+      this.assertArtifactSetOnConfiguredStorage(document, StorageVendor.Local);
       const path = String(req.params[0]);
       try {
         await adapter.writeObject(
@@ -831,27 +833,70 @@ export class StorageController {
       const orgId = extractOrgId(req);
       const document = await this.findArtifactSet(req, orgId);
       const adapter = await this.localArtifactAdapter(req);
-      const fullPath = await adapter.localObjectPath(
-        `${this.artifactRoot(document)}/${String(req.params[0])}`,
+      this.assertArtifactSetOnConfiguredStorage(document, StorageVendor.Local);
+      const filePath = String(req.params[0]);
+      const opened = await adapter.openObject(
+        `${this.artifactRoot(document)}/${filePath}`,
       );
-      if (fullPath === null) {
+      if (opened === null) {
         throw new NotFoundError('File not found');
       }
-      // The mount itself sits under a dot folder (~/.local), which send would
-      // otherwise answer as missing.
-      res.sendFile(fullPath, { dotfiles: 'allow' }, (error?: Error) => {
-        if (error === undefined || res.headersSent) {
-          return;
-        }
-        next(
-          (error as { code?: string }).code === 'ENOENT'
-            ? new NotFoundError('File not found')
-            : error,
-        );
-      });
+      this.sendOpenedFile(req, res, next, opened, filePath);
     } catch (error) {
       next(error);
     }
+  }
+
+  /**
+   * Streams a file from its open handle, honouring a single byte range, so what
+   * is sent is the file that was checked, not whatever its path names later.
+   */
+  private sendOpenedFile(
+    req: AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+    opened: { handle: FileHandle; size: number },
+    filePath: string,
+  ): void {
+    const { handle, size } = opened;
+    const ranges =
+      req.headers.range === undefined ? undefined : req.range(size);
+    if (ranges === -1) {
+      void handle.close();
+      res
+        .status(HTTP_STATUS.RANGE_NOT_SATISFIABLE)
+        .set('Content-Range', `bytes */${size}`)
+        .end();
+      return;
+    }
+    // A malformed header or several ranges get the whole file, as send does.
+    const range =
+      Array.isArray(ranges) && ranges.length === 1 ? ranges[0] : undefined;
+    const start = range?.start ?? 0;
+    const end = range?.end ?? size - 1;
+    res.type(path.extname(filePath) || 'application/octet-stream');
+    res.set('Accept-Ranges', 'bytes');
+    res.set('Content-Length', String(size === 0 ? 0 : end - start + 1));
+    if (range !== undefined) {
+      res.status(HTTP_STATUS.PARTIAL_CONTENT);
+      res.set('Content-Range', `bytes ${start}-${end}/${size}`);
+    } else {
+      res.status(HTTP_STATUS.OK);
+    }
+    if (size === 0) {
+      void handle.close();
+      res.end();
+      return;
+    }
+    const stream = handle.createReadStream({ start, end, autoClose: true });
+    stream.on('error', (error) => {
+      if (res.headersSent) {
+        res.destroy(error);
+      } else {
+        next(error);
+      }
+    });
+    stream.pipe(res);
   }
 
   /** Removes a revision's whole tree, then its document. Safe to repeat. */

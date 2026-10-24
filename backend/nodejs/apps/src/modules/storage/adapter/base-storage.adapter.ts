@@ -1,3 +1,4 @@
+import type { FileHandle } from 'fs/promises';
 import { StorageServiceInterface } from '../services/storage.service';
 import {
   Document,
@@ -246,13 +247,13 @@ export class StorageServiceAdapter {
         );
   }
 
-  localObjectPath(storageKey: string): Promise<string | null> {
-    return this.adapter.localObjectPath
-      ? this.adapter.localObjectPath(storageKey)
+  openObject(
+    storageKey: string,
+  ): Promise<{ handle: FileHandle; size: number } | null> {
+    return this.adapter.openObject
+      ? this.adapter.openObject(storageKey)
       : Promise.reject(
-          new Error(
-            'localObjectPath not implemented for this storage provider',
-          ),
+          new Error('openObject not implemented for this storage provider'),
         );
   }
 }

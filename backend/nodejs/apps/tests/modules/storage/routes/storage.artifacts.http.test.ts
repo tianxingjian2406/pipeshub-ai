@@ -262,6 +262,54 @@ describe('Artifact sets over HTTP: the local disk path', () => {
     expect(filesOnDisk()).to.have.length(0)
   })
 
+  const uploadAndReadUrl = async (filePath: string, bytes: Buffer): Promise<{ url: string; headers: Record<string, string> }> => {
+    const p = await presign([{ path: filePath, contentType: 'application/octet-stream' }])
+    const put = await fetch(p.body.files[0].url, { method: 'PUT', headers: p.body.files[0].headers, body: bytes })
+    expect(put.status, await put.text()).to.equal(200)
+    const r = await call('POST', `/internal/artifacts/${p.body.documentId}/read-urls`, { paths: [filePath] })
+    return r.body.files[0]
+  }
+
+  it('serves the whole file with its type and length, a suffix range, and 416 past the end', async () => {
+    const bytes = Buffer.from('0123456789')
+    const f = await uploadAndReadUrl('record.json', bytes)
+
+    const whole = await fetch(f.url, { headers: f.headers })
+    expect(whole.status).to.equal(200)
+    expect(whole.headers.get('content-type')).to.match(/^application\/json/)
+    expect(whole.headers.get('content-length')).to.equal('10')
+    expect(whole.headers.get('accept-ranges')).to.equal('bytes')
+    expect(Buffer.from(await whole.arrayBuffer()).equals(bytes)).to.be.true
+
+    const tail = await fetch(f.url, { headers: { ...f.headers, range: 'bytes=-3' } })
+    expect(tail.status).to.equal(206)
+    expect(tail.headers.get('content-range')).to.equal('bytes 7-9/10')
+    expect(Buffer.from(await tail.arrayBuffer()).toString()).to.equal('789')
+
+    const past = await fetch(f.url, { headers: { ...f.headers, range: 'bytes=50-60' } })
+    expect(past.status).to.equal(416)
+    expect(past.headers.get('content-range')).to.equal('bytes */10')
+  })
+
+  it('does not serve a file that is itself a symlink out of the mount', async () => {
+    const f = await uploadAndReadUrl('record.json', Buffer.from('{}'))
+    const onDisk = path.join(home, '.local', MOUNT, ORG_ID, 'PipesHub', 'records', VRID, REV, 'record.json')
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'artifact-http-outside-'))
+    try {
+      const secret = path.join(outside, 'secret.txt')
+      fs.writeFileSync(secret, 'top secret')
+      fs.rmSync(onDisk)
+      fs.symlinkSync(secret, onDisk)
+
+      const res = await fetch(f.url, { headers: f.headers })
+
+      expect(res.status).to.not.equal(200)
+      expect(await res.text()).to.not.contain('top secret')
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
   it('answers 404 for a file the revision does not have yet', async () => {
     const ok = await presign([{ path: 'record.json', contentType: 'application/json' }])
     const r = await call('POST', `/internal/artifacts/${ok.body.documentId}/read-urls`, { paths: ['groups.json'] })

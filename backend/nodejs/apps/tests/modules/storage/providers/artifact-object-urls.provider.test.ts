@@ -119,26 +119,46 @@ describe('Signed object URLs for artifact sets', () => {
     const adapter = () =>
       new LocalStorageAdapter({ mountName: 'PipesHub', baseUrl: 'http://localhost:3000' } as any)
 
+    const keyPath = () => path.join(fs.realpathSync(home), '.local', 'PipesHub', KEY)
+
+    const read = async (a: LocalStorageAdapter, key = KEY): Promise<string | null> => {
+      const opened = await a.openObject(key)
+      if (opened === null) return null
+      try {
+        return (await opened.handle.readFile()).toString('utf8')
+      } finally {
+        await opened.handle.close()
+      }
+    }
+
+    const refused = async (attempt: () => Promise<unknown>, label: string): Promise<void> => {
+      try {
+        await attempt()
+        expect.fail(`${label}: not refused`)
+      } catch (error) {
+        expect(error, label).to.be.instanceOf(StorageValidationError)
+      }
+    }
+
     it('writes a file at its key, creating its folders, and replaces it whole', async () => {
       const a = adapter()
       await a.writeObject(KEY, Buffer.from('first'))
       await a.writeObject(KEY, Buffer.from('second'))
 
-      const full = (await a.localObjectPath(KEY))!
-      expect(full.startsWith(fs.realpathSync(home))).to.be.true
-      expect(fs.readFileSync(full, 'utf8')).to.equal('second')
+      const opened = (await a.openObject(KEY))!
+      try {
+        expect(opened.size).to.equal('second'.length)
+        expect((await opened.handle.readFile()).toString('utf8')).to.equal('second')
+      } finally {
+        await opened.handle.close()
+      }
       // The temporary file the atomic write used is gone.
-      expect(fs.readdirSync(path.dirname(full))).to.deep.equal(['part-0000.jsonl'])
+      expect(fs.readdirSync(path.dirname(keyPath()))).to.deep.equal(['part-0000.jsonl'])
     })
 
     it('refuses a key that would leave the mount', async () => {
       for (const key of ['../escape.json', '/etc/passwd', 'a/../../b']) {
-        try {
-          await adapter().localObjectPath(key)
-          expect.fail(key)
-        } catch (error) {
-          expect(error, key).to.be.instanceOf(StorageValidationError)
-        }
+        await refused(() => adapter().openObject(key), key)
       }
     })
 
@@ -148,26 +168,50 @@ describe('Signed object URLs for artifact sets', () => {
       const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'artifact-outside-'))
       try {
         fs.writeFileSync(path.join(outside, 'part-0000.jsonl'), 'secret')
-        const blocks = path.dirname((await a.localObjectPath(KEY))!)
+        const blocks = path.dirname(keyPath())
         fs.rmSync(blocks, { recursive: true })
         fs.symlinkSync(outside, blocks)
 
-        for (const attempt of [() => a.writeObject(KEY, Buffer.from('escaped')), () => a.localObjectPath(KEY)]) {
-          try {
-            await attempt()
-            expect.fail('followed the link')
-          } catch (error) {
-            expect(error).to.be.instanceOf(StorageValidationError)
-          }
-        }
+        await refused(() => a.writeObject(KEY, Buffer.from('escaped')), 'write')
+        await refused(() => a.openObject(KEY), 'read')
         expect(fs.readFileSync(path.join(outside, 'part-0000.jsonl'), 'utf8')).to.equal('secret')
       } finally {
         fs.rmSync(outside, { recursive: true, force: true })
       }
     })
 
-    it('answers null for a key whose folder does not exist', async () => {
-      expect(await adapter().localObjectPath('org/PipesHub/records/vr/abcdef12/record.json')).to.equal(null)
+    it('does not read a file that is itself a symlink out of the mount', async () => {
+      const a = adapter()
+      await a.writeObject(KEY, Buffer.from('inside'))
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'artifact-outside-'))
+      try {
+        const secret = path.join(outside, 'secret.txt')
+        fs.writeFileSync(secret, 'secret')
+        fs.rmSync(keyPath())
+        fs.symlinkSync(secret, keyPath())
+
+        await refused(() => a.openObject(KEY), 'read')
+        // A write replaces the link itself (the atomic rename), never what it points at.
+        await a.writeObject(KEY, Buffer.from('replaced'))
+        expect(fs.lstatSync(keyPath()).isSymbolicLink()).to.be.false
+        expect(await read(a)).to.equal('replaced')
+        expect(fs.readFileSync(secret, 'utf8')).to.equal('secret')
+      } finally {
+        fs.rmSync(outside, { recursive: true, force: true })
+      }
+    })
+
+    it('refuses to read a folder at a file key', async () => {
+      const a = adapter()
+      fs.mkdirSync(keyPath(), { recursive: true })
+      await refused(() => a.openObject(KEY), 'folder')
+    })
+
+    it('answers null for a key that does not exist, or whose folder does not', async () => {
+      const a = adapter()
+      expect(await read(a, 'org/PipesHub/records/vr/abcdef12/record.json')).to.equal(null)
+      await a.writeObject(KEY, Buffer.from('x'))
+      expect(await read(a, KEY.replace('part-0000', 'part-0001'))).to.equal(null)
     })
   })
 })

@@ -1,3 +1,4 @@
+import type { FileHandle } from 'fs/promises';
 import {
   Document,
   FilePayload,
@@ -202,8 +203,10 @@ export interface StorageServiceInterface {
   writeObject?(storageKey: string, data: Buffer): Promise<void>;
 
   /**
-   * Where a storage key really is on disk, symlinks followed, checked to be
-   * inside the mount; null when its folder does not exist. Local only.
+   * Opens a storage key for reading, checked to be a regular file inside the
+   * mount; null when it does not exist. The caller closes the handle. Local only.
    */
-  localObjectPath?(storageKey: string): Promise<string | null>;
+  openObject?(
+    storageKey: string,
+  ): Promise<{ handle: FileHandle; size: number } | null>;
 }

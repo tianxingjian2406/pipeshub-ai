@@ -435,6 +435,37 @@ describe('StorageController artifact sets', () => {
     })
   })
 
+  describe('local file routes for a revision on another storage', () => {
+    beforeEach(() => {
+      storageType = 'local'
+      Object.assign(adapter, { writeObject: sinon.stub().resolves(), openObject: sinon.stub().resolves(null) })
+    })
+
+    it('refuses to write a remote revision onto the local mount', async () => {
+      const doc = artifactRow()
+
+      const { error } = await run(
+        'putArtifactFile',
+        request({ params: { documentId: String(doc._id), 0: 'manifest.json' }, body: Buffer.from('{}') }),
+      )
+
+      expect(error).to.be.instanceOf(ConflictError)
+      expect((adapter as any).writeObject.called).to.be.false
+    })
+
+    it('refuses to read a remote revision from the local mount', async () => {
+      const doc = artifactRow({ storageVendor: StorageVendor.AzureBlob })
+
+      const { error } = await run(
+        'getArtifactFile',
+        request({ params: { documentId: String(doc._id), 0: 'manifest.json' } }),
+      )
+
+      expect(error).to.be.instanceOf(ConflictError)
+      expect((adapter as any).openObject.called).to.be.false
+    })
+  })
+
   describe('purgeArtifactSet', () => {
     it('removes the whole tree under the root, then the document', async () => {
       const doc = artifactRow()
